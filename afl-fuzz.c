@@ -110,6 +110,8 @@
 EXP_ST u8 *in_dir,                    /* Input directory with test cases  */
           *out_file,                  /* File to fuzz, if any             */
           *out_dir,                   /* Working & output directory       */
+          *information_file_name,     /* Information file name            */
+          *time_file_name,            /* Time file name                   */
           *sync_dir,                  /* Synchronization directory        */
           *sync_id,                   /* Fuzzer ID                        */
           *use_banner,                /* Display banner                   */
@@ -135,6 +137,7 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            timeout_given,             /* Specific timeout given?          */
            not_on_tty,                /* stdout is not a tty              */
            term_too_small,            /* terminal dimensions too small    */
+           state_of_fuzz = 0,         /* State of fuzzing                 */
            uses_asan,                 /* Target uses ASAN?                */
            no_forkserver,             /* Disable forkserver?              */
            crash_mode,                /* Crash mode! Yeah!                */
@@ -154,6 +157,8 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
            dev_null_fd = -1,          /* Persistent fd for /dev/null      */
+           information_fd,            /* Persistent fd for out-file       */
+           time_fd,                   /* Persistent fd for time file      */
            fsrv_ctl_fd,               /* Fork server control pipe (write) */
            fsrv_st_fd;                /* Fork server status pipe (read)   */
 
@@ -175,9 +180,12 @@ static volatile u8 stop_soon,         /* Ctrl-C pressed?                  */
                    clear_screen = 1,  /* Window resized?                  */
                    child_timed_out;   /* Traced process timed out?        */
 
+static float rate = 1;                /* Rate of regret                   */
+
 EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            queued_variable,           /* Testcases with variable behavior */
            queued_at_start,           /* Total number of initial inputs   */
+           queued_paths_initial,      /* Initial paths                    */
            queued_discovered,         /* Items discovered during this run */
            queued_imported,           /* Items imported via -S            */
            queued_favored,            /* Paths deemed favorable           */
@@ -187,6 +195,7 @@ EXP_ST u32 queued_paths,              /* Total number of queued testcases */
            cur_skipped_paths,         /* Abandoned inputs in cur cycle    */
            cur_depth,                 /* Current path depth               */
            max_depth,                 /* Max path depth                   */
+           calculate_coe = 0,         /* Coefficient of calculate rate    */
            useless_at_start,          /* Number of useless starting paths */
            var_byte_count,            /* Bitmap bytes with var behavior   */
            current_entry,             /* Current queue entry ID           */
@@ -198,6 +207,7 @@ EXP_ST u64 total_crashes,             /* Total number of crashes          */
            unique_tmouts,             /* Timeouts with unique signatures  */
            unique_hangs,              /* Hangs with unique signatures     */
            total_execs,               /* Total execve() calls             */
+           total_fuzz = 0,            /* Total fuzzs                      */
            slowest_exec_ms,           /* Slowest testcase non hang in ms  */
            start_time,                /* Unix start time (ms)             */
            last_path_time,            /* Time for most recent path (ms)   */
@@ -249,7 +259,9 @@ static s32 cpu_aff = -1;       	      /* Selected CPU core                */
 
 #endif /* HAVE_AFFINITY */
 
-static FILE* plot_file;               /* Gnuplot output file              */
+static FILE *plot_file,               /* Gnuplot output file              */
+            *time_file,               /* Time output file                 */
+            *information_file;        /* Information output file          */
 
 struct queue_entry {
 
@@ -262,14 +274,26 @@ struct queue_entry {
       passed_det,                     /* Deterministic stages passed?     */
       has_new_cov,                    /* Triggers new coverage?           */
       var_behavior,                   /* Variable behavior?               */
+      state,                          /* Was fuzzed dutring state 2?      */
       favored,                        /* Currently favored?               */
+      last_found,                     /* Number of found paths            */
+      abandon,                        /* Marked as abandon?               */
+      TS_max,                         /* Chose for t/s is maxed?          */
       fs_redundant;                   /* Marked as redundant in the fs?   */
 
   u32 bitmap_size,                    /* Number of bits set in bitmap     */
+      chose_time,                     /* Number of times chose for fuzz   */
+      serial,                         /* Serial number of this test case  */
       exec_cksum;                     /* Checksum of the execution trace  */
 
   u64 exec_us,                        /* Execution time (us)              */
       handicap,                       /* Number of queue cycles behind    */
+      line,                           /* Number of paths to find path     */
+      exec_num,                       /* Number of execution of this path */
+      last_energy,                    /* Number of test cases last fuzzing*/
+      mutation_num,                   /* Number of mutating the test case */
+      exec_by_mutation,               /* Number of mutated by this test   */
+      power,                          /* Power of mutation number         */
       depth;                          /* Path depth                       */
 
   u8* trace_mini;                     /* Trace bytes, if kept             */
@@ -428,7 +452,7 @@ void setup_ipsm()
 {
   ipsm = agopen("g", Agdirected, 0);
 
-  agattr(ipsm, AGNODE, "color", "black"); //Default node colr is black
+  agattr(ipsm, AGNODE, "color", "black"); //Default node color is black
   agattr(ipsm, AGEDGE, "color", "black"); //Default edge color is black
 
   khs_ipsm_paths = kh_init(hs32);
@@ -1162,6 +1186,31 @@ static u64 get_cur_time_us(void) {
 
 }
 
+/* TODO: remove if unused */
+static u32 get_sqrt(u32 val){
+  u32 i = 0;
+  u64 r = 0;
+  for(; r <= val; i++){
+    r = i * i;
+  }
+
+  return i-1;
+}
+
+
+/* Get a number of power of two. */
+/* TODO: remove if unused */
+static u64 get_power_of_two(u32 val){
+  u32 i = 0;
+  u64 ret = 1;
+
+  for(; i < val; i++){
+    ret = ret * 2;
+  }
+
+  return ret;
+}
+
 
 /* Generate a random number (from 0 to limit - 1). This may
    have slight bias. */
@@ -1583,6 +1632,65 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 }
 
+/* Setup the time file fds.*/
+EXP_ST void setup_time_fds(void) {
+
+  ACTF("Setup time file...");
+
+  time_file_name = alloc_printf("%s/information_of_time", out_dir);
+  time_fd = open(time_file_name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (time_fd < 0) PFATAL("Unable to create '%s'.", time_file_name);
+
+  time_file = fdopen(time_fd, "a");
+  if (!time_file) PFATAL("Fdopen time file failed.");
+                     /* ignore errors */
+}
+
+/* Setup the information file fds.*/
+EXP_ST void setup_information_fds(void) {
+
+  ACTF("Setup information file...");
+
+  information_file_name = alloc_printf("%s/information_of_havoc", out_dir);
+  information_fd = open(information_file_name, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (information_fd < 0) PFATAL("Unable to create '%s'.", information_file_name);
+
+  information_file = fdopen(information_fd, "a");
+  if (!information_file) PFATAL("Fdopen information file failed.");
+                     /* ignore errors */
+}
+
+/* Write information to time file*/
+static void write_to_time_file(u64 record_time) {
+    fprintf(time_file, "State:%d Time:%llu\n", state_of_fuzz, record_time);
+
+}
+
+/* Write information to output file*/
+static void write_to_information_file(u8* items_name) {
+
+  if(!strcmp(items_name,"start")){
+
+    fprintf(information_file, "Cksum:%u Stage_max:%d ", queue_cur->exec_cksum, stage_max);
+
+  }
+  else if(!strcmp(items_name,"end")){
+
+    fprintf(information_file, "Final_stage_max:%d State:%d\n", stage_max, state_of_fuzz);
+
+  }
+  else{
+
+    u32 temp_cksum;
+
+    temp_cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+    fprintf(information_file, "Find:%d,%u ", stage_cur, temp_cksum);
+
+  }
+
+}
+
 
 /* Append new test case to the queue. */
 
@@ -1600,6 +1708,16 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   q->generating_state_id = target_state_id;
   q->is_initial_seed = 0;
   q->unique_state_count = 0;
+  q->mutation_num = 0;
+  q->exec_num = 1;
+  q->exec_by_mutation = 0;
+  q->last_found = 0;
+  q->chose_time = 0;
+  q->abandon = 0;
+  q->line = queued_paths;
+  q->last_energy = 0;
+  q->state = 0;
+  q->serial = queued_paths;
 
   if (q->depth > max_depth) max_depth = q->depth;
 
@@ -1620,6 +1738,10 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
     q_prev100->next_100 = q;
     q_prev100 = q;
 
+  }
+
+  if(!strncmp(stage_name, "havoc", 5) || !strncmp(stage_name, "splice", 6)){
+    write_to_information_file("find");
   }
 
   /* AFLNet: extract regions keeping client requests if needed */
@@ -2144,6 +2266,73 @@ static void update_bitmap_score(struct queue_entry* q) {
 
 }
 
+/* Set up the VAMAB algorithm */
+static void schedule(void) {
+  struct queue_entry *q, *p;
+  u32 i = 0;
+
+  q = queue;
+  p = queue;
+  while(q){
+    if(!q->was_fuzzed && queue_cur->was_fuzzed){
+      queue_cur = q;
+      current_entry = i;
+      break;
+    }
+    q = q->next;
+    i++;
+  }
+  q = queue;
+  while(q) {
+    if(!q->was_fuzzed){
+     state_of_fuzz = 1;
+     return;
+    }
+    q = q->next;
+  }
+  state_of_fuzz = 2;
+  q = queue;
+  p = queue;
+  i = 0;
+  while(p){
+    if(p->state != 2)
+      break;
+    i++;
+    p = p->next;
+  }
+  if(!p){
+    p = queue;
+    while(p){
+      p->state = 0;
+      p = p->next;
+    }
+    p = queue;
+    i = 0;
+  }
+  while(q){
+    if(q->exec_by_mutation * p->mutation_num * get_sqrt(p->serial) < p->exec_by_mutation * q->mutation_num * get_sqrt(q->serial) && q->state == 0){
+      p = q;
+      current_entry = i;
+    }
+    q = q->next;
+    i++;
+  }
+  queue_cur = p;
+
+}
+
+static u32 judge_seeds(void) {
+  struct queue_entry *q;
+  q = queue;
+
+  while(q){
+    if(queue_cur->mutation_num * q->exec_num < q->mutation_num * queue_cur->exec_num && queue_cur != q)
+      return 1;
+    q = q->next;
+  }
+
+  return 0;
+}
 
 /* The second part of the mechanism discussed above is a routine that
    goes over top_rated[] entries, and then sequentially grabs winners for
@@ -4392,10 +4581,10 @@ static void maybe_update_plot_file(double bitmap_cvg, double eps) {
      execs_per_sec */
 
   fprintf(plot_file,
-          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f\n",
+          "%llu, %llu, %u, %u, %u, %u, %0.02f%%, %llu, %llu, %u, %0.02f, %llu, %llu\n",
           get_cur_time() / 1000, queue_cycle - 1, current_entry, queued_paths,
           pending_not_fuzzed, pending_favored, bitmap_cvg, unique_crashes,
-          unique_hangs, max_depth, eps); /* ignore errors */
+          unique_hangs, max_depth, eps, total_execs, state_of_fuzz); /* ignore errors */
 
   fflush(plot_file);
 
@@ -5398,6 +5587,173 @@ static void show_init_stats(void) {
 
 }
 
+
+/* Find first power of two greater or equal to val (assuming val under
+   2^31). */
+
+static u32 next_p2(u32 val) {
+
+  u32 ret = 1;
+  while (val > ret) ret <<= 1;
+  return ret;
+
+}
+
+/* Find the power of two smaller to val. */
+static u64 first_p2(u64 val) {
+  u64 ret = 1, i = 0;
+  while (val >= ret){
+    ret <<= 1;
+    i++;
+  }
+  i--;
+  return i;
+}
+
+/* Calculate power of each seeds. */
+static u64 calculate_power(u32 len) {
+  u64 max_power = 0;
+
+  max_power += (len << 3);
+  max_power += ((len << 3)- 1);
+  max_power += ((len << 3)- 3);
+  max_power += (len * 3 - 4);
+  max_power += 2 * len * ARITH_MAX;
+  max_power += 4 * (len - 1) * ARITH_MAX;
+  max_power += 4 * (len - 3) * ARITH_MAX;
+  max_power += len * sizeof(interesting_8);
+  max_power += 2 * (len - 1) * (sizeof(interesting_16) >> 1);
+  max_power += 2 * (len - 3) * (sizeof(interesting_32) >> 2);
+  max_power += 2 * extras_cnt * len;
+  max_power += MIN(a_extras_cnt, USE_AUTO_EXTRAS) * len;
+
+  return max_power;
+}
+
+
+/* Trim all new test cases to save cycles when doing deterministic checks. The
+   trimmer uses power-of-two increments somewhere between 1/16 and 1/1024 of
+   file size, to keep the stage short and sweet. */
+
+static u8 trim_case(char** argv, struct queue_entry* q, u8* in_buf) {
+
+  static u8 tmp[64];
+  static u8 clean_trace[MAP_SIZE];
+
+  u8  needs_write = 0, fault = 0;
+  u32 trim_exec = 0;
+  u32 remove_len;
+  u32 len_p2;
+
+  /* Although the trimmer will be less useful when variable behavior is
+     detected, it will still work to some extent, so we don't check for
+     this. */
+
+  if (q->len < 5) return 0;
+
+  stage_name = tmp;
+  bytes_trim_in += q->len;
+
+  /* Select initial chunk len, starting with large steps. */
+
+  len_p2 = next_p2(q->len);
+
+  remove_len = MAX(len_p2 / TRIM_START_STEPS, TRIM_MIN_BYTES);
+
+  /* Continue until the number of steps gets too high or the stepover
+     gets too small. */
+
+  while (remove_len >= MAX(len_p2 / TRIM_END_STEPS, TRIM_MIN_BYTES)) {
+
+    u32 remove_pos = remove_len;
+
+    sprintf(tmp, "trim %s/%s", DI(remove_len), DI(remove_len));
+
+    stage_cur = 0;
+    stage_max = q->len / remove_len;
+
+    while (remove_pos < q->len) {
+
+      u32 trim_avail = MIN(remove_len, q->len - remove_pos);
+      u32 cksum;
+
+      write_with_gap(in_buf, q->len, remove_pos, trim_avail);
+
+      fault = run_target(argv, exec_tmout);
+      trim_execs++;
+
+      if (stop_soon || fault == FAULT_ERROR) goto abort_trimming;
+
+      /* Note that we don't keep track of crashes or hangs here; maybe TODO? */
+
+      cksum = hash32(trace_bits, MAP_SIZE, HASH_CONST);
+
+      /* If the deletion had no impact on the trace, make it permanent. This
+         isn't perfect for variable-path inputs, but we're just making a
+         best-effort pass, so it's not a big deal if we end up with false
+         negatives every now and then. */
+
+      if (cksum == q->exec_cksum) {
+
+        u32 move_tail = q->len - remove_pos - trim_avail;
+
+        q->len -= trim_avail;
+        len_p2  = next_p2(q->len);
+
+        memmove(in_buf + remove_pos, in_buf + remove_pos + trim_avail,
+                move_tail);
+
+        /* Let's save a clean trace, which will be needed by
+           update_bitmap_score once we're done with the trimming stuff. */
+
+        if (!needs_write) {
+
+          needs_write = 1;
+          memcpy(clean_trace, trace_bits, MAP_SIZE);
+
+        }
+
+      } else remove_pos += remove_len;
+
+      /* Since this can be slow, update the screen every now and then. */
+
+      if (!(trim_exec++ % stats_update_freq)) show_stats();
+      stage_cur++;
+
+    }
+
+    remove_len >>= 1;
+
+  }
+
+  /* If we have made changes to in_buf, we also need to update the on-disk
+     version of the test case. */
+
+  if (needs_write) {
+
+    s32 fd;
+
+    unlink(q->fname); /* ignore errors */
+
+    fd = open(q->fname, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+    if (fd < 0) PFATAL("Unable to create '%s'", q->fname);
+
+    ck_write(fd, in_buf, q->len, q->fname);
+    close(fd);
+
+    memcpy(trace_bits, clean_trace, MAP_SIZE);
+    update_bitmap_score(q);
+
+  }
+
+abort_trimming:
+
+  bytes_trim_out += q->len;
+  return fault;
+
+}
+
 /* Write a modified test case, run program, process results. Handle
    error conditions, returning 1 if it's time to bail out. This is
    a helper function for fuzz_one(). */
@@ -5496,6 +5852,9 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   //Update fuzz count, no matter whether the generated test is interesting or not
   if (state_aware_mode) update_fuzzs();
+  
+  //Update fuzz count for MaB, TODO: maybe integrate into update_fuzzs()
+  total_fuzz++;
 
   if (stop_soon) return 1;
 
@@ -5520,6 +5879,8 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
   }
 
   /* This handles FAULT_ERROR for us: */
+
+  queue_cur->mutation_num++;
 
   queued_discovered += save_if_interesting(argv, out_buf, len, fault);
 
@@ -5839,13 +6200,21 @@ static u8 fuzz_one(char** argv) {
 
   s32 len, fd, temp_len, i, j;
   u8  *in_buf = NULL, *out_buf, *orig_in, *ex_tmp, *eff_map = 0;
-  u64 havoc_queued,  orig_hit_cnt, new_hit_cnt;
-  u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1, M2_len;
+  u64 havoc_queued,  orig_hit_cnt, new_hit_cnt, last_mutation_num = 0, energy, energy_in_det = 0, start_record, end_record, record_time;
+  u32 splice_cycle = 0, perf_score = 100, orig_perf, prev_cksum, eff_cnt = 1, M2_len, last_queued_paths = queued_paths, record_num = 0, average_cost = 0;
 
-  u8  ret_val = 1, doing_det = 0;
+  struct queue_entry* q = queue;
+
+  u8  ret_val = 1, doing_det = 0, ret_of_fuzz, skip_havoc = 0;
+
+  start_record = get_cur_time_us();
+
+  float regret = 0;
 
   u8  a_collect[MAX_AUTO_EXTRA];
   u32 a_len = 0;
+  
+  last_mutation_num = queue_cur->mutation_num;
 
 #ifdef IGNORE_FINDS
 
@@ -5900,6 +6269,8 @@ AFLNET_REGIONS_SELECTION:;
   subseq_tmouts = 0;
 
   cur_depth = queue_cur->depth;
+
+  /*TODO: LOOK INTO CALIBRATION, TRIMMING */
 
   u32 M2_start_region_ID = 0, M2_region_count = 0;
   /* Identify the prefix M1, the candidate subsequence M2, and the suffix M3. See AFLNet paper */
@@ -6009,11 +6380,53 @@ AFLNET_REGIONS_SELECTION:;
   //Save the len for later use
   M2_len = len;
 
+  queue_cur->chose_time++;
+
   /*********************
    * PERFORMANCE SCORE *
    *********************/
 
   orig_perf = perf_score = calculate_score(queue_cur);
+
+  /* VAMAB algorithm */
+
+  if(queued_paths == queued_paths_initial)
+    average_cost = total_fuzz / queued_paths;
+  else
+    average_cost = total_fuzz / (queued_paths - queued_paths_initial);
+
+  if(average_cost == 0)
+    average_cost = 1024;
+
+  if(state_of_fuzz == 2){
+    queue_cur->state = 2;
+    if(queue_cur->last_found == 0){
+      energy = MIN(2 * queue_cur->last_energy, 16 * average_cost);
+    }
+    else{
+      energy = MIN(queue_cur->last_energy, 16 * average_cost);
+    }
+    if(energy == 0){
+      if(queue_cur->exec_num > average_cost)
+        energy = average_cost/4;
+      else if(queue_cur->exec_num > average_cost/2)
+        energy = average_cost/2;
+      else
+        energy = average_cost;
+      }
+    energy = energy * rate;
+  }
+  else{
+    if(queue_cur->exec_num > average_cost)
+      energy = average_cost/4;
+    else if(queue_cur->exec_num > average_cost/2)
+      energy = average_cost/2;
+    else
+      energy = average_cost;
+    energy = energy * rate;
+  }
+    
+    goto havoc_stage;
 
   /* Skip right away if -d is given, if we have done deterministic fuzzing on
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
@@ -6026,6 +6439,9 @@ AFLNET_REGIONS_SELECTION:;
      for this master instance. */
 
   if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1)
+    goto havoc_stage;
+
+  if(energy < calculate_power(len))
     goto havoc_stage;
 
   doing_det = 1;
@@ -6057,6 +6473,8 @@ AFLNET_REGIONS_SELECTION:;
     stage_cur_byte = stage_cur >> 3;
 
     FLIP_BIT(out_buf, stage_cur);
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
@@ -6151,6 +6569,8 @@ AFLNET_REGIONS_SELECTION:;
     FLIP_BIT(out_buf, stage_cur);
     FLIP_BIT(out_buf, stage_cur + 1);
 
+    energy_in_det++;
+
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
     FLIP_BIT(out_buf, stage_cur);
@@ -6179,6 +6599,8 @@ AFLNET_REGIONS_SELECTION:;
     FLIP_BIT(out_buf, stage_cur + 1);
     FLIP_BIT(out_buf, stage_cur + 2);
     FLIP_BIT(out_buf, stage_cur + 3);
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
@@ -6231,6 +6653,8 @@ AFLNET_REGIONS_SELECTION:;
     stage_cur_byte = stage_cur;
 
     out_buf[stage_cur] ^= 0xFF;
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
@@ -6310,6 +6734,8 @@ AFLNET_REGIONS_SELECTION:;
 
     *(u16*)(out_buf + i) ^= 0xFFFF;
 
+    energy_in_det++;
+
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     stage_cur++;
 
@@ -6346,6 +6772,8 @@ AFLNET_REGIONS_SELECTION:;
     stage_cur_byte = i;
 
     *(u32*)(out_buf + i) ^= 0xFFFFFFFF;
+
+    energy_in_det++;
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
     stage_cur++;
@@ -6403,6 +6831,8 @@ skip_bitflip:
         stage_cur_val = j;
         out_buf[i] = orig + j;
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6414,6 +6844,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         out_buf[i] = orig - j;
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -6474,6 +6906,8 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = orig + j;
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6483,6 +6917,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = orig - j;
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -6499,6 +6935,8 @@ skip_bitflip:
         stage_cur_val = j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) + j);
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6508,6 +6946,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         *(u16*)(out_buf + i) = SWAP16(SWAP16(orig) - j);
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -6567,6 +7007,8 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = orig + j;
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6576,6 +7018,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = orig - j;
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -6591,6 +7035,8 @@ skip_bitflip:
         stage_cur_val = j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) + j);
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6600,6 +7046,8 @@ skip_bitflip:
 
         stage_cur_val = -j;
         *(u32*)(out_buf + i) = SWAP32(SWAP32(orig) - j);
+
+        energy_in_det++;
 
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
@@ -6660,6 +7108,8 @@ skip_arith:
       stage_cur_val = interesting_8[j];
       out_buf[i] = interesting_8[j];
 
+      energy_in_det++;
+
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       out_buf[i] = orig;
@@ -6713,6 +7163,8 @@ skip_arith:
 
         *(u16*)(out_buf + i) = interesting_16[j];
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6726,6 +7178,9 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u16*)(out_buf + i) = SWAP16(interesting_16[j]);
+
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6782,6 +7237,8 @@ skip_arith:
 
         *(u32*)(out_buf + i) = interesting_32[j];
 
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6795,6 +7252,9 @@ skip_arith:
         stage_val_type = STAGE_VAL_BE;
 
         *(u32*)(out_buf + i) = SWAP32(interesting_32[j]);
+
+        energy_in_det++;
+
         if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
         stage_cur++;
 
@@ -6861,6 +7321,8 @@ skip_interest:
       last_len = extras[j].len;
       memcpy(out_buf + i, extras[j].data, last_len);
 
+      energy_in_det++;
+
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       stage_cur++;
@@ -6904,6 +7366,8 @@ skip_interest:
 
       /* Copy tail */
       memcpy(ex_tmp + i + extras[j].len, out_buf + i, len - i);
+
+      energy_in_det++;
 
       if (common_fuzz_stuff(argv, ex_tmp, len + extras[j].len)) {
         ck_free(ex_tmp);
@@ -6961,6 +7425,8 @@ skip_user_extras:
       last_len = a_extras[j].len;
       memcpy(out_buf + i, a_extras[j].data, last_len);
 
+      energy_in_det++;
+
       if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
       stage_cur++;
@@ -7016,7 +7482,14 @@ havoc_stage:
 
   }
 
+  stage_max = energy - energy_in_det;
+
   if (stage_max < HAVOC_MIN) stage_max = HAVOC_MIN;
+
+  s32 temp_stage = stage_max;
+  u32 temp_score = perf_score;
+
+  write_to_information_file("start");
 
   temp_len = len;
 
@@ -7487,7 +7960,9 @@ havoc_stage:
 
     }
 
-    if (common_fuzz_stuff(argv, out_buf, temp_len))
+    ret_of_fuzz = common_fuzz_stuff(argv, out_buf, temp_len);
+
+    if (ret_of_fuzz)
       goto abandon_entry;
 
     /* out_buf might have been mangled a bit, so let's restore it to its
@@ -7502,18 +7977,26 @@ havoc_stage:
 
     if (queued_paths != havoc_queued) {
 
+      /* TODO: perhaps fine-tune this */
+
       if (perf_score <= HAVOC_MAX_MULT * 100) {
         stage_max  *= 2;
         perf_score *= 2;
       }
 
+      record_num = stage_cur + 1;
       havoc_queued = queued_paths;
+      regret = (float)record_num / stage_max;
 
     }
 
   }
 
+exit_havoc:
+
   new_hit_cnt = queued_paths + unique_crashes;
+
+  write_to_information_file("end");
 
   if (!splice_cycle) {
     stage_finds[STAGE_HAVOC]  += new_hit_cnt - orig_hit_cnt;
@@ -7535,6 +8018,8 @@ havoc_stage:
      code to mutate that blob. */
 
 retry_splicing:
+  /* turned splicing off, TODO: perhaps turn splicing back on */
+  use_splicing = 0;
 
   if (use_splicing && splice_cycle++ < SPLICE_CYCLES &&
       queued_paths > 1 && M2_len > 1) {
@@ -7609,6 +8094,8 @@ retry_splicing:
     out_buf = ck_alloc_nozero(len);
     memcpy(out_buf, in_buf, len);
 
+    queue_cur->chose_time++;
+
     goto havoc_stage;
 
   }
@@ -7623,6 +8110,10 @@ abandon_entry:
 
   /* Update pending_not_fuzzed count if we made it through the calibration
      cycle and have not seen this entry before. */
+
+  if(!queue_cur->was_fuzzed){
+    queue_cur->line = queued_paths;
+  }
 
   if (!stop_soon && !queue_cur->cal_failed && !queue_cur->was_fuzzed) {
     queue_cur->was_fuzzed = 1;
@@ -7639,6 +8130,30 @@ abandon_entry:
   ck_free(eff_map);
 
   delete_kl_messages(kl_messages);
+
+  /* VAMAB algorithm */
+
+  queue_cur->TS_max = 0;
+  queue_cur->last_found = queued_paths - last_queued_paths;
+  queue_cur->last_energy = queue_cur->mutation_num - last_mutation_num;
+  if(regret == 0)
+    regret = 1.1;
+
+  rate = ((rate * calculate_coe) + regret)/(calculate_coe + 1);
+
+  calculate_coe++;
+  if ( calculate_coe > queued_paths / 100)
+    calculate_coe = queued_paths / 100;
+
+  if ( rate > 1.5 )
+    rate = 1.5;
+  else if(rate < 0.1)
+    rate = 0.1;
+
+  end_record = get_cur_time_us();
+  record_time = end_record - start_record;
+
+  write_to_time_file(record_time);
 
   return ret_val;
 
@@ -8270,7 +8785,7 @@ EXP_ST void setup_dirs_fds(void) {
 
   fprintf(plot_file, "# unix_time, cycles_done, cur_path, paths_total, "
                      "pending_total, pending_favs, map_size, unique_crashes, "
-                     "unique_hangs, max_depth, execs_per_sec\n");
+                     "unique_hangs, max_depth, execs_per_sec, total_execs, state\n");
                      /* ignore errors */
 
 }
@@ -9373,6 +9888,8 @@ int main(int argc, char** argv) {
           sync_fuzzers(use_argv);
 
       }
+
+      schedule();
 
       skipped_fuzz = fuzz_one(use_argv);
 
