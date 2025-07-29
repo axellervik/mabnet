@@ -6264,13 +6264,79 @@ static u8 fuzz_one(char** argv) {
     fflush(stdout);
   }
 
+  /* Map the test case into memory. */
+
+  fd = open(queue_cur->fname, O_RDONLY);
+
+  if (fd < 0) PFATAL("Unable to open '%s'", queue_cur->fname);
+
+  len = queue_cur->len;
+
+  orig_in = in_buf = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+
+  if (orig_in == MAP_FAILED) PFATAL("Unable to mmap '%s'", queue_cur->fname);
+
+  close(fd);
+
+  /* We could mmap() out_buf as MAP_PRIVATE, but we end up clobbering every
+     single byte anyway, so it wouldn't give us any performance or memory usage
+     benefits. */
+
+  out_buf = ck_alloc_nozero(len);
+
 AFLNET_REGIONS_SELECTION:;
 
   subseq_tmouts = 0;
 
   cur_depth = queue_cur->depth;
 
-  /*TODO: LOOK INTO CALIBRATION, TRIMMING */
+  /*******************************************
+   * CALIBRATION (only if failed earlier on) *
+   *******************************************/
+
+  if (queue_cur->cal_failed) {
+
+    u8 res = FAULT_TMOUT;
+
+    if (queue_cur->cal_failed < CAL_CHANCES) {
+
+      res = calibrate_case(argv, queue_cur, in_buf, queue_cycle - 1, 0);
+
+      if (res == FAULT_ERROR)
+        FATAL("Unable to execute target application");
+
+    }
+
+    if (stop_soon || res != crash_mode) {
+      cur_skipped_paths++;
+      goto abandon_entry;
+    }
+
+  }
+
+  /************
+   * TRIMMING *
+   ************/
+
+  if (!dumb_mode && !queue_cur->trim_done) {
+
+    u8 res = trim_case(argv, queue_cur, in_buf);
+
+    if (res == FAULT_ERROR)
+      FATAL("Unable to execute target application");
+
+    if (stop_soon) {
+      cur_skipped_paths++;
+      goto abandon_entry;
+    }
+
+    /* Don't retry trimming, even if it failed. */
+
+    queue_cur->trim_done = 1;
+
+    if (len != queue_cur->len) len = queue_cur->len;
+
+  }
 
   u32 M2_start_region_ID = 0, M2_region_count = 0;
   /* Identify the prefix M1, the candidate subsequence M2, and the suffix M3. See AFLNet paper */
