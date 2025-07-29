@@ -3578,6 +3578,37 @@ static void write_to_testcase(void* mem, u32 len) {
 
 }
 
+
+/* The same, but with an adjustable gap. Used for trimming. */
+
+static void write_with_gap(void* mem, u32 len, u32 skip_at, u32 skip_len) {
+
+  s32 fd = out_fd;
+  u32 tail_len = len - skip_at - skip_len;
+
+  if (out_file) {
+
+    unlink(out_file); /* Ignore errors. */
+
+    fd = open(out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+    if (fd < 0) PFATAL("Unable to create '%s'", out_file);
+
+  } else lseek(fd, 0, SEEK_SET);
+
+  if (skip_at) ck_write(fd, mem, skip_at, out_file);
+
+  if (tail_len) ck_write(fd, mem + skip_at + skip_len, tail_len, out_file);
+
+  if (!out_file) {
+
+    if (ftruncate(fd, len - skip_len)) PFATAL("ftruncate() failed");
+    lseek(fd, 0, SEEK_SET);
+
+  } else close(fd);
+
+}
+
 static void show_stats(void);
 
 /* Calibrate a new test case. This is done when processing the input directory
