@@ -3574,7 +3574,27 @@ static u8 run_target(char** argv, u32 timeout) {
 
 static void write_to_testcase(void* mem, u32 len) {
 
-  //AFLNet sends data via network so it does not need this function
+  //AFLNet sends data via network so it does not need this function  s32 fd = out_fd;
+  //nvm pfb do
+
+  if (out_file) {
+
+    unlink(out_file); /* Ignore errors. */
+
+    fd = open(out_file, O_WRONLY | O_CREAT | O_EXCL, 0600);
+
+    if (fd < 0) PFATAL("Unable to create '%s'", out_file);
+
+  } else lseek(fd, 0, SEEK_SET);
+
+  ck_write(fd, mem, len, out_file);
+
+  if (!out_file) {
+
+    if (ftruncate(fd, len)) PFATAL("ftruncate() failed");
+    lseek(fd, 0, SEEK_SET);
+
+  } else close(fd);
 
 }
 
@@ -6351,7 +6371,7 @@ AFLNET_REGIONS_SELECTION:;
 
   if (!dumb_mode && !queue_cur->trim_done) {
 
-    u8 res = trim_case(argv, queue_cur, in_buf);
+    u8 res =  (argv, queue_cur, in_buf);
 
     if (res == FAULT_ERROR)
       FATAL("Unable to execute target application");
