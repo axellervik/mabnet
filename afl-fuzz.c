@@ -1198,20 +1198,6 @@ static u32 get_sqrt(u32 val){
 }
 
 
-/* Get a number of power of two. */
-/* TODO: remove if unused */
-static u64 get_power_of_two(u32 val){
-  u32 i = 0;
-  u64 ret = 1;
-
-  for(; i < val; i++){
-    ret = ret * 2;
-  }
-
-  return ret;
-}
-
-
 /* Generate a random number (from 0 to limit - 1). This may
    have slight bias. */
 
