@@ -3563,6 +3563,8 @@ static void write_to_testcase(void* mem, u32 len) {
   //AFLNet sends data via network so it does not need this function  s32 fd = out_fd;
   //nvm pfb do
 
+  s32 fd = out_fd;
+
   if (out_file) {
 
     unlink(out_file); /* Ignore errors. */
